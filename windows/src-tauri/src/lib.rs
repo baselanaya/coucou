@@ -1,5 +1,7 @@
-// Coucou for Windows — app wiring and the commands the island calls.
+// Coucou — app wiring and the commands the island calls.
 
+mod access;
+mod agents;
 mod claude;
 mod files;
 mod hooks;
@@ -7,11 +9,14 @@ mod integrations;
 mod island;
 mod log;
 mod pipe;
-mod platform;
 mod secrets;
 mod settings;
 mod tray;
+#[cfg(windows)]
+mod win_user;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -27,6 +32,15 @@ use island::{PollGate, ScreenInfo};
 use pipe::Pending;
 use settings::Settings;
 
+/// Keeps spawned helpers from flashing a console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Home-directory-shaped tests (hooks installer, access levels) point $HOME at
+/// temp directories; the lock keeps them from racing each other process-wide.
+#[cfg(test)]
+static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct Shared {
     pub settings: Mutex<Settings>,
     pub gate: Arc<PollGate>,
@@ -39,23 +53,26 @@ pub struct BootInfo {
     screen: ScreenInfo,
     version: String,
     hook_path: String,
-    /// False where the OS has no global cursor (Wayland): the page then reports
-    /// the cursor from its own mouse events.
-    cursor_poll: bool,
 }
 
 #[tauri::command]
 fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
     let mut settings = shared.settings.lock().unwrap().clone();
-    // The real state of ~/.claude/settings.json wins over whatever we stored.
-    settings.hooks_installed = hooks::status().installed;
+    // The real state of each agent's config file wins over whatever we stored.
+    for status in hooks::all_statuses() {
+        match status.agent.as_str() {
+            "claude" => settings.hooks_installed = status.installed,
+            "zcode" => settings.hooks_installed_zcode = status.installed,
+            "codex" => settings.hooks_installed_codex = status.installed,
+            _ => {}
+        }
+    }
     let screen = island::screen_info(&app, &settings.screen);
     BootInfo {
         settings,
         screen,
         version: env!("CARGO_PKG_VERSION").to_string(),
         hook_path: settings::hook_exe_path().to_string_lossy().to_string(),
-        cursor_poll: platform::CURSOR_POLL,
     }
 }
 
@@ -94,24 +111,21 @@ fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
     shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
     island::apply_geometry(&app, &pref, collapsed);
     // The wake strip must always take the mouse, and a resize invalidates the flag.
-    island::refresh_click_through(&app, &shared.gate);
+    island::set_ignore_cursor(&app, false);
+    shared.gate.forget_ignore_state();
     shared.gate.set_active(!collapsed);
 }
 
 /// The front end pushes the island shape; Rust decides click-through from it.
 #[tauri::command]
-fn set_island_rect(app: AppHandle, shared: State<Shared>, x: f64, y: f64, width: f64, height: f64) {
+fn set_island_rect(shared: State<Shared>, x: f64, y: f64, width: f64, height: f64) {
     shared.gate.set_rect(island::IslandRect { x, y, w: width, h: height });
-    // Without the cursor poll the input region is the click-through: it follows the island.
-    if !platform::CURSOR_POLL {
-        island::refresh_click_through(&app, &shared.gate);
-    }
 }
 
 #[tauri::command]
 fn focus_window(app: AppHandle, focused: bool) {
     let Some(win) = island::window(&app) else { return };
-    platform::set_activating(&win, focused);
+    island::set_activating(&win, focused);
     if focused {
         let _ = win.set_focus();
     }
@@ -129,40 +143,94 @@ fn open_url(url: String) {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return;
     }
-    platform::open_url(&url);
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("rundll32.exe");
+        cmd.args(["url.dll,FileProtocolHandler", &url]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    };
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(&url);
+        cmd
+    };
+    let _ = cmd.spawn();
 }
 
-/// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
-/// and falls back to the file manager otherwise.
+/// "Open folder" for a session's working directory: the file manager on Linux
+/// (xdg-open → Dolphin on KDE), VS Code when `code` is on PATH on Windows with
+/// Explorer as the fallback. The island never launches an editor the user
+/// didn't ask for.
 #[tauri::command]
-fn open_in_vscode(path: Option<String>) -> bool {
-    // No shell anywhere near this. The path is a project folder chosen by
-    // whoever is using Claude Code, and a shell would happily read `&`, `^`, `%`
-    // or `$` in a folder name as syntax. Finding the launcher ourselves and
-    // handing the path over as a separate argument keeps it a path.
-    let path = path.filter(|p| !p.is_empty());
-    // It arrives in a hook payload: only an existing folder, given by its full
-    // path, goes any further. `code` would read `--something` as an option, and
-    // xdg-open would launch a file with whatever handles its type.
-    if let Some(p) = path.as_deref() {
-        let p = std::path::Path::new(p);
-        if !(p.is_absolute() && p.is_dir()) {
-            return false;
+fn open_project(path: Option<String>) -> bool {
+    #[cfg(unix)]
+    {
+        if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+            if Command::new("xdg-open").arg(p).spawn().is_ok() {
+                return true;
+            }
+        }
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // No `cmd /C` anywhere near this. The path is a project folder chosen by
+        // whoever is using the agents, and cmd would happily read `&`, `^` and `%`
+        // in a folder name as syntax. Finding the launcher ourselves and handing
+        // the path over as a separate argument keeps it a path.
+        if let Some(code) = find_on_path("code") {
+            let mut cmd = Command::new(code);
+            if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+                cmd.arg(p);
+            }
+            if cmd.creation_flags(CREATE_NO_WINDOW).spawn().is_ok() {
+                return true;
+            }
+        }
+        if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+            let _ = Command::new("explorer").arg(p).spawn();
+        }
+        false
+    }
+}
+
+/// Our own `which`: walks %PATH% against %PATHEXT% on Windows, checks the
+/// executable bit on Unix — no shell involved.
+/// Rust quotes arguments correctly for `.cmd`/`.bat` targets since 1.77, so
+/// spawning `code.cmd` directly is safe.
+#[cfg(windows)]
+fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let dirs = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&dirs) {
+        for ext in exts.split(';').filter(|e| !e.is_empty()) {
+            let candidate = dir.join(format!("{stem}{}", ext.to_lowercase()));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
-    if let Some(code) = platform::find_on_path("code") {
-        let mut cmd = Command::new(code);
-        if let Some(p) = path.as_deref() {
-            cmd.arg(p);
-        }
-        if platform::no_console(&mut cmd).spawn().is_ok() {
-            return true;
+    None
+}
+
+/// Kept for parity with the Windows launcher search; the Linux "Open folder"
+/// goes straight through xdg-open.
+#[cfg(unix)]
+#[allow(dead_code)]
+fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&dirs) {
+        let candidate = dir.join(stem);
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some(candidate);
+            }
         }
     }
-    if let Some(p) = path.as_deref() {
-        platform::reveal_folder(p);
-    }
-    false
+    None
 }
 
 #[tauri::command]
@@ -177,17 +245,38 @@ fn set_paused(paused: bool) {
     integrations::set_paused(paused);
 }
 
-// ── Claude Code hooks ─────────────────────────────────────────────────────────
+// ── Access levels ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn hooks_status() -> HookStatus {
-    hooks::status()
+fn access_get(agent: String) -> access::AccessInfo {
+    access::info(&agent)
+}
+
+/// Only ever called from an explicit click on a level.
+#[tauri::command]
+fn access_set(agent: String, level: String) -> Result<String, String> {
+    let level = access::AccessLevel::parse(&level)
+        .ok_or_else(|| format!("Unknown access level '{level}'"))?;
+    access::set(&agent, level)
+}
+
+// ── Agent hooks (Claude Code, zcode, Codex) ────────────────────────────────────
+
+#[tauri::command]
+fn hooks_status(agent: String) -> Result<HookStatus, String> {
+    hooks::status(&agent)
+}
+
+/// One entry per agent, for the settings window's boot.
+#[tauri::command]
+fn hooks_statuses() -> Vec<HookStatus> {
+    hooks::all_statuses()
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
-fn hooks_preview(install: bool) -> Result<HookPreview, String> {
-    hooks::preview(install)
+fn hooks_preview(agent: String, install: bool) -> Result<HookPreview, String> {
+    hooks::preview(&agent, install)
 }
 
 /// Only ever called from an explicit click in the settings window.
@@ -195,15 +284,21 @@ fn hooks_preview(install: bool) -> Result<HookPreview, String> {
 fn hooks_apply(
     app: AppHandle,
     shared: State<Shared>,
+    agent: String,
     install: bool,
     fingerprint: String,
 ) -> Result<String, String> {
     // The fingerprint comes from the preview the user actually looked at, so a
-    // settings.json that changed in between is refused rather than overwritten.
-    let backup = hooks::write(install, &fingerprint)?;
+    // config that changed in between is refused rather than overwritten.
+    let backup = hooks::write(&agent, install, &fingerprint)?;
     let updated = {
         let mut current = shared.settings.lock().unwrap();
-        current.hooks_installed = install;
+        match agent.as_str() {
+            "claude" => current.hooks_installed = install,
+            "zcode" => current.hooks_installed_zcode = install,
+            "codex" => current.hooks_installed_codex = install,
+            _ => {}
+        }
         let _ = settings::save(&current);
         current.clone()
     };
@@ -241,8 +336,11 @@ async fn chat_send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let (model, api_base) = {
+        let settings = shared.settings.lock().unwrap();
+        (settings.model.clone(), settings.api_base.clone())
+    };
+    claude::send(&chat, &model, &api_base, query, context).await
 }
 
 #[tauri::command]
@@ -359,7 +457,6 @@ fn open_settings_window(app: AppHandle) {
 }
 
 pub fn run() {
-    platform::prepare_environment();
     let loaded = settings::load();
     let gate = Arc::new(PollGate::new());
 
@@ -382,9 +479,12 @@ pub fn run() {
             focus_window,
             reposition,
             open_url,
-            open_in_vscode,
+            open_project,
             quit_app,
+            access_get,
+            access_set,
             hooks_status,
+            hooks_statuses,
             hooks_preview,
             hooks_apply,
             approval_decision,
@@ -409,16 +509,18 @@ pub fn run() {
             create_settings_window(&handle);
 
             if let Some(win) = island::window(&handle) {
-                platform::make_non_activating(&win);
-                island::apply_geometry(&handle, &loaded.screen, false);
+                island::make_non_activating(&win);
+                // GTK drops position requests made while the window is still
+                // unmapped — the WM centers it on first show instead — so the
+                // island is placed after it is on screen.
                 let _ = win.show();
+                island::apply_geometry(&handle, &loaded.screen, false);
             }
+            // And once more after the WM has had its say (Linux placement
+            // policies override pre-map positions; see pin_after_show).
+            #[cfg(unix)]
+            island::pin_after_show(handle.clone());
             gate.collapsed.store(false, Ordering::Relaxed);
-            // Nothing drawn yet, so nothing takes the mouse until the page
-            // reports the island's shape.
-            if !platform::CURSOR_POLL {
-                island::refresh_click_through(&handle, &gate);
-            }
             gate.set_active(true);
             island::spawn_cursor_poll(handle.clone(), gate.clone());
 

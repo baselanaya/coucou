@@ -5,7 +5,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { Settings } from "./state";
+import type { AccessInfo, AccessLevel, Settings } from "./state";
+
+export type { AccessInfo, AccessLevel };
 
 export const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -26,8 +28,6 @@ export interface BootInfo {
   screen: { x: number; y: number; width: number; height: number; scale: number };
   version: string;
   hookPath: string;
-  /** False where the OS has no global cursor (Wayland): see Island.followPageCursor. */
-  cursorPoll: boolean;
 }
 
 export const Bridge = {
@@ -52,8 +52,8 @@ export const Bridge = {
 
   openUrl: (url: string) => call<void>("open_url", { url }),
 
-  /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
-  openInVSCode: (path: string | null) => call<boolean>("open_in_vscode", { path }),
+  /** Opens a session's working folder in the file manager (Dolphin, Explorer). */
+  openProject: (path: string | null) => call<boolean>("open_project", { path }),
 
   quit: () => call<void>("quit_app"),
 
@@ -62,16 +62,25 @@ export const Bridge = {
   /** Writes to %LOCALAPPDATA%\Coucou\coucou.log, next to the Rust lines. */
   log: (message: string) => call<void>("log_line", { message }),
 
-  // ── Claude Code hooks ─────────────────────────────────────────────────────
-  hooksStatus: () => call<HookStatus>("hooks_status"),
+  // ── Access levels (Claude Code, Codex; zcode is per-session) ─────────────
+  accessGet: (agent: string) => call<AccessInfo>("access_get", { agent }),
+  /** Sets the level — only ever from an explicit click on one. */
+  accessSet: (agent: string, level: AccessLevel) =>
+    callOrThrow<string>("access_set", { agent, level }),
+
+  // ── Coding-agent hooks (Claude Code, zcode, Codex) ────────────────────────
+  hooksStatus: (agent: string) => call<HookStatus>("hooks_status", { agent }),
+  /** One entry per agent, in display order. */
+  hooksStatuses: () => call<HookStatus[]>("hooks_statuses"),
   /** Diff to show before anything is written. `install: false` previews removal. */
-  hooksPreview: (install: boolean) => callOrThrow<HookPreview>("hooks_preview", { install }),
+  hooksPreview: (agent: string, install: boolean) =>
+    callOrThrow<HookPreview>("hooks_preview", { agent, install }),
   /**
-   * Writes ~/.claude/settings.json — only ever after an explicit click, and only
-   * when the file still matches the preview the user looked at.
+   * Writes the agent's hook config — only ever after an explicit click, and
+   * only when the file still matches the preview the user looked at.
    */
-  hooksApply: (install: boolean, fingerprint: string) =>
-    callOrThrow<string>("hooks_apply", { install, fingerprint }),
+  hooksApply: (agent: string, install: boolean, fingerprint: string) =>
+    callOrThrow<string>("hooks_apply", { agent, install, fingerprint }),
 
   approvalDecision: (requestId: string, decision: "allow" | "deny") =>
     call<void>("approval_decision", { requestId, decision }),
@@ -119,6 +128,9 @@ export interface DroppedFile {
 }
 
 export interface HookStatus {
+  agent: "claude" | "zcode" | "codex";
+  name: string;
+  blurb: string;
   installed: boolean;
   settingsPath: string;
   hookPath: string;

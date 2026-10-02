@@ -32,11 +32,19 @@ export async function refreshConfigured() {
     const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
     State.integrations[id] = { ...info, configured: present };
   }
-  const hooks = State.settings.hooksInstalled;
-  const claude = State.integrations.integration_claude ?? {
-    data: {}, error: null, loaded: false, configured: false,
+  // Each agent pill counts as configured when its own harness is hooked in.
+  const agentFlags: Record<string, boolean> = {
+    integration_claude: State.settings.hooksInstalled,
+    integration_zcode: State.settings.hooksInstalledZcode,
+    integration_codex: State.settings.hooksInstalledCodex,
   };
-  State.integrations.integration_claude = { ...claude, configured: hooks };
+  for (const [id, hooked] of Object.entries(agentFlags)) {
+    const info = State.integrations[id] ?? {
+      data: {}, error: null, loaded: false, configured: false,
+    };
+    const access = (await Bridge.accessGet(id)) ?? null;
+    State.integrations[id] = { ...info, configured: hooked, access };
+  }
   State.notify();
 }
 

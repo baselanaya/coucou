@@ -1,31 +1,40 @@
 //! coucou-hook — the relay Claude Code runs on every hook event.
 //!
 //! Reads the hook JSON on stdin, adds a little terminal context, and hands it to
-//! Coucou over the named pipe `\\.\pipe\coucou-<sid>` (Windows) or the Unix
-//! socket `$XDG_RUNTIME_DIR/coucou.sock` (Linux).
+//! Coucou: over the named pipe `\\.\pipe\coucou-<sid>` on Windows, over the Unix
+//! domain socket $XDG_RUNTIME_DIR/coucou.sock on Linux.
 //!
 //! Hard rule (docs/CLAUDE.md): **never block Claude Code.**
-//! * If the pipe does not exist — Coucou is closed — we exit 0 immediately with
-//!   nothing on stdout, and the session carries on untouched.
-//! * Every step runs under a deadline enforced by the main thread, so a pipe that
-//!   accepts the connection and then stops reading cannot wedge the session
+//! * If the transport is not there — Coucou is closed — we exit 0 immediately
+//!   with nothing on stdout, and the session carries on untouched.
+//! * Every step runs under a deadline enforced by the main thread, so a server
+//!   that accepts the connection and then stops reading cannot wedge the session
 //!   either: we abandon the worker and exit.
 //! * Only `PermissionRequest` waits for an answer, because approving from the
 //!   island is the whole point. No answer means empty stdout, and Claude Code
 //!   asks in the terminal exactly as if Coucou were not installed.
 //!
-//! Usage: `coucou-hook <EventName>` (the name is also read from the JSON).
+//! Usage: `coucou-hook [--agent <name>] <EventName>` (the name is also read
+//! from the JSON).
 
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
-/// Budget for getting a pipe connection. Beyond this Claude Code wins, always.
+/// Budget for getting a connection. Beyond this Claude Code wins, always.
+#[cfg(windows)]
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 /// Whole-run budget for an event nobody waits on: connect and write, no more.
 const FIRE_AND_FORGET_BUDGET: Duration = Duration::from_secs(2);
 /// How long a permission prompt may stay on screen before the terminal takes over.
 const DECISION_BUDGET: Duration = Duration::from_secs(110);
+
+/// `ERROR_PIPE_BUSY` — every instance is serving someone else right now. This is
+/// the one error worth retrying: the server exists and a slot will free up.
+#[cfg(windows)]
+const ERROR_PIPE_BUSY: i32 = 231;
 
 /// Fields that are pointless to forward and can be enormous (a whole file read,
 /// a full command output). The island never shows them.
@@ -36,27 +45,82 @@ const MAX_FIELD_LEN: usize = 2_000;
 
 #[cfg(windows)]
 mod win;
-#[cfg(windows)]
-use win::connect;
-
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod unix;
-#[cfg(target_os = "linux")]
-use unix::connect;
+
+/// A connection to the app: the pipe's file handle on Windows, a UnixStream on
+/// Linux. talk() only needs Read + Write either way.
+trait Stream: Read + Write {}
+impl<T: Read + Write> Stream for T {}
+
+/// `\\.\pipe\coucou-<sid>`. The SID keeps two accounts on the same machine from
+/// ever meeting on the same pipe; the name falls back to the user name only if
+/// the SID cannot be read at all, which should not happen.
+#[cfg(windows)]
+fn pipe_path() -> String {
+    let key = win::current_user_sid()
+        .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "user".into()));
+    format!(r"\\.\pipe\coucou-{key}")
+}
+
+/// Opens the pipe. Retries only while the server is busy: any other error means
+/// there is nothing to talk to, and waiting would only delay Claude Code.
+#[cfg(windows)]
+fn connect() -> Option<Box<dyn Stream>> {
+    use std::os::windows::io::AsRawHandle;
+    let path = pipe_path();
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => {
+                let handle = windows::Win32::Foundation::HANDLE(file.as_raw_handle());
+                // Somebody else's server on our pipe name gets nothing from us.
+                if !win::pipe_server_is_same_user(handle) {
+                    return None;
+                }
+                return Some(Box::new(file));
+            }
+            Err(err) => {
+                if err.raw_os_error() != Some(ERROR_PIPE_BUSY) || Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+}
+
+/// Connects to the app's Unix socket. A local socket connects near-instantly,
+/// and the main-thread budget is the hard stop; nothing to retry here.
+#[cfg(unix)]
+fn connect() -> Option<Box<dyn Stream>> {
+    use std::os::unix::net::UnixStream;
+    let stream = UnixStream::connect(unix::socket_path()).ok()?;
+    // A server that accepts and then goes quiet must not hold us past the
+    // permission budget. Fire-and-forget events get their close immediately.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(115)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    Some(Box::new(stream))
+}
 
 fn main() {
-    let Some((payload, event)) = read_event() else { std::process::exit(0) };
+    let (agent, arg_event) = parse_args(&std::env::args().skip(1).collect::<Vec<String>>());
+    let Some((payload, event)) = read_event(arg_event, agent) else { std::process::exit(0) };
 
     let waits_for_answer = event == "PermissionRequest";
     let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
 
     // The worker owns every blocking call. If it overruns the budget we simply
-    // stop listening and exit: the process dying takes the pipe handle with it.
+    // stop listening and exit: the process dying takes the connection with it.
     // (No catch_unwind here — the release profile is panic = "abort", so it would
     // be dead code. `talk` is written to have nothing to panic on instead.)
     let (tx, rx) = mpsc::channel::<Option<String>>();
     std::thread::spawn(move || {
-        let _ = tx.send(talk(&payload, waits_for_answer));
+        let answer = match connect() {
+            Some(stream) => talk(stream, &payload, waits_for_answer),
+            None => None,
+        };
+        let _ = tx.send(answer);
     });
 
     if let Ok(Some(decision)) = rx.recv_timeout(budget) {
@@ -72,6 +136,9 @@ fn main() {
 
 /// The documented PermissionRequest output. Anything we do not recognise prints
 /// nothing at all rather than guessing — silence is the safe answer.
+/// Claude Code documents this shape; zcode validates the very same one
+/// (hookSpecificOutput.hookEventName must be PermissionRequest, decision.behavior
+/// allow/deny) and Codex accepts it too.
 /// See https://code.claude.com/docs/en/hooks
 fn decision_json(decision: &str) -> Option<String> {
     let behavior = match decision.trim() {
@@ -86,8 +153,22 @@ fn decision_json(decision: &str) -> Option<String> {
     ))
 }
 
+/// `coucou-hook [--agent <name>] <EventName>`. The agent that spawned us
+/// (claude, zcode, codex) rides along in the payload so the island can tell its
+/// sessions apart. Without the flag it is Claude Code, which is what the first
+/// installs in ~/.claude/settings.json still say.
+fn parse_args(args: &[String]) -> (String, String) {
+    if args.first().map(String::as_str) == Some("--agent") {
+        (args.get(1).cloned().unwrap_or_default(), args.get(2).cloned().unwrap_or_default())
+    } else {
+        ("claude".to_string(), args.first().cloned().unwrap_or_default())
+    }
+}
+
 /// Reads stdin and returns the payload to forward plus the event name.
-fn read_event() -> Option<(String, String)> {
+/// `arg_event` is the event name from our own command line, `agent` the harness
+/// that spawned us; the JSON usually carries the event too, and its value wins.
+fn read_event(arg_event: String, agent: String) -> Option<(String, String)> {
     let mut raw = Vec::new();
     if std::io::stdin().read_to_end(&mut raw).is_err() || raw.is_empty() {
         return None;
@@ -100,26 +181,6 @@ fn read_event() -> Option<(String, String)> {
     let mut payload = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
     let map = payload.as_object_mut()?;
 
-    // Parse argv: "coucou-hook.exe [--agent <name>] [<EventName>]"
-    // --agent tags the payload with coucou_agent so the app routes to the right pill.
-    // Absent or invalid names are validated and discarded by the app, not here.
-    let mut agent = String::new();
-    let mut arg_event = String::new();
-    {
-        let mut it = std::env::args().skip(1);
-        while let Some(arg) = it.next() {
-            if arg == "--agent" {
-                agent = it.next().unwrap_or_default();
-            } else if arg_event.is_empty() {
-                arg_event = arg;
-            }
-        }
-    }
-    // Which agent this hook was installed for. Absent means Claude Code,
-    // so existing hook commands keep working unchanged.
-    if !agent.is_empty() {
-        map.insert("coucou_agent".into(), serde_json::Value::String(agent));
-    }
     let event = map
         .get("hook_event_name")
         .and_then(|v| v.as_str())
@@ -127,6 +188,9 @@ fn read_event() -> Option<(String, String)> {
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
+    if !agent.is_empty() {
+        map.insert("agent".into(), serde_json::Value::String(agent));
+    }
 
     for field in DROPPED_FIELDS {
         map.remove(*field);
@@ -146,7 +210,7 @@ fn read_event() -> Option<(String, String)> {
         }
     }
 
-    // Which terminal the session runs in. Unlike macOS, Coucou here accepts
+    // Which terminal the session runs in. Unlike macOS, Coucou on Windows accepts
     // events from every terminal, so this is context only — never a filter.
     for (key, var) in [
         ("term_program", "TERM_PROGRAM"),
@@ -189,9 +253,7 @@ fn truncate_strings(value: &mut serde_json::Value) {
 }
 
 /// Connect, send, and — for a permission request — wait for the island's word.
-fn talk(payload: &str, waits_for_answer: bool) -> Option<String> {
-    let mut pipe = connect()?;
-
+fn talk(mut pipe: Box<dyn Stream>, payload: &str, waits_for_answer: bool) -> Option<String> {
     if pipe.write_all(payload.as_bytes()).is_err() {
         return None;
     }
@@ -222,6 +284,25 @@ fn talk(payload: &str, waits_for_answer: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_flag_moves_the_event_name_over() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(
+            parse_args(&a(&["--agent", "zcode", "Stop"])),
+            ("zcode".to_string(), "Stop".to_string())
+        );
+        // The first installs, and a bare Claude Code hook, pass only the event.
+        assert_eq!(
+            parse_args(&a(&["PreToolUse"])),
+            ("claude".to_string(), "PreToolUse".to_string())
+        );
+        // A harness that appends the event name itself changes nothing.
+        assert_eq!(
+            parse_args(&a(&["--agent", "codex", "Stop", "Stop"])),
+            ("codex".to_string(), "Stop".to_string())
+        );
+    }
 
     #[test]
     fn decision_json_matches_the_documented_shape() {

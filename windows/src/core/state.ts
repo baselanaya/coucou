@@ -3,7 +3,7 @@
 import type { BotEmoteName, BotStateName, IslandMode, IslandViewName } from "./layout";
 import type { EyeShape } from "../mochi/engine";
 
-export type AgentSource = "claudeCode" | "n8n" | "agent";
+export type AgentSource = "claudeCode" | "n8n";
 export type PillBadge = "approval" | "finished" | "error";
 
 export interface AgentTask {
@@ -19,6 +19,8 @@ export interface AgentTask {
   miniEye?: EyeShape | null;
   pillBadge?: PillBadge | null;
   sessionCwd?: string | null;
+  /** Which harness the live session belongs to: "Claude Code", "zcode", "codex". */
+  agent?: string | null;
 }
 
 export interface ApprovalInfo {
@@ -58,7 +60,9 @@ const task = (
 
 /** AgentTask.integrationAgents — same ids, names and colours as macOS. */
 export const INTEGRATION_AGENTS: AgentTask[] = [
-  task("integration_claude", "VS Code", "#F5F6F8", "claudeCode"),
+  task("integration_claude", "Claude", "#D97757", "claudeCode"),
+  task("integration_zcode", "ZCode", "#6E7BF2", "claudeCode"),
+  task("integration_codex", "Codex", "#10A37F", "claudeCode"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -68,10 +72,27 @@ export const INTEGRATION_AGENTS: AgentTask[] = [
   task("integration_stripe", "Stripe", "#0570DE", "n8n"),
 ];
 
+/** The coding-agent pills: always present, one per harness, never toggled off. */
+export const AGENT_TASK_IDS = ["integration_claude", "integration_zcode", "integration_codex"];
+
+export function isAgentTask(id: string): boolean {
+  return AGENT_TASK_IDS.includes(id);
+}
+
 export const TOGGLEABLE_INTEGRATION_IDS = [
   "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
   "integration_notion", "integration_calcom", "integration_stripe",
 ];
+
+export type AccessLevel = "ask" | "auto" | "root";
+
+export interface AccessInfo {
+  agent: string;
+  level: AccessLevel | null;
+  /** False when the harness has no persistent access setting (zcode). */
+  configurable: boolean;
+  note: string;
+}
 
 /** What an integration poller last reported. */
 export interface IntegrationInfo {
@@ -79,6 +100,8 @@ export interface IntegrationInfo {
   error: string | null;
   loaded: boolean;
   configured: boolean;
+  /** Access level, for the coding-agent pills. */
+  access?: AccessInfo | null;
 }
 
 export interface Settings {
@@ -90,8 +113,12 @@ export interface Settings {
   screen: "primary" | "cursor";
   autostart: boolean;
   hooksInstalled: boolean;
-  /** Claude model used by the chat. */
+  hooksInstalledZcode: boolean;
+  hooksInstalledCodex: boolean;
+  /** Model used by the chat. */
   model: string;
+  /** Anthropic-compatible Messages API base; GLM runs from Z.AI's. */
+  apiBase: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -99,13 +126,14 @@ export const DEFAULT_SETTINGS: Settings = {
   soundVolume: 0.12,
   autoCloseInterval: 15,
   absenceInterval: 180,
-  activeIntegrations: [
-    "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
-  ],
+  activeIntegrations: [],
   screen: "primary",
   autostart: false,
   hooksInstalled: false,
+  hooksInstalledZcode: false,
+  hooksInstalledCodex: false,
   model: "claude-opus-5",
+  apiBase: "https://api.anthropic.com",
 };
 
 type Listener = () => void;
@@ -199,59 +227,24 @@ class AppState {
     this.notify();
   }
 
-  /** loadIntegrationTasks() — VS Code always on, the rest opt-in (max 4). */
+  /** loadIntegrationTasks() — agent pills always on, services opt-in (max 4). */
   loadIntegrationTasks() {
     for (const proto of INTEGRATION_AGENTS) {
       const shouldLoad =
-        proto.id === "integration_claude" || this.settings.activeIntegrations.includes(proto.id);
+        isAgentTask(proto.id) || this.settings.activeIntegrations.includes(proto.id);
       const idx = this.tasks.findIndex((t) => t.id === proto.id);
       if (shouldLoad && idx < 0) this.tasks.push({ ...proto, steps: [] });
       if (!shouldLoad && idx >= 0) this.tasks.splice(idx, 1);
     }
-    // Order: integration_claude first, then agent_* pills (visible in slice(0,4)),
-    // then other integrations in declaration order.
+    // Keep the declared order so pills never shuffle.
     const order = INTEGRATION_AGENTS.map((t) => t.id);
-    this.tasks.sort((a, b) => {
-      const isAgentA = a.id.startsWith("agent_");
-      const isAgentB = b.id.startsWith("agent_");
-      // integration_claude always first
-      if (a.id === "integration_claude") return -1;
-      if (b.id === "integration_claude") return 1;
-      // agent_* before other integrations; preserve insertion order among themselves
-      if (isAgentA && !isAgentB) return -1;
-      if (isAgentB && !isAgentA) return 1;
-      if (isAgentA && isAgentB) return 0;
-      // both known integrations → declaration order
-      return order.indexOf(a.id) - order.indexOf(b.id);
-    });
+    this.tasks.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
     if (!this.focusId) this.focusId = "integration_claude";
     this.notify();
   }
 
-  removeTask(id: string) {
-    const idx = this.tasks.findIndex((t) => t.id === id);
-    if (idx < 0) return;
-    this.tasks.splice(idx, 1);
-    if (this.focusId === id) this.focusId = this.tasks[0]?.id ?? "integration_claude";
-    this.notify();
-  }
-
-  /** Creates a dynamic agent_ pill on first event; no-ops if it already exists.
-   *  Inserted right after integration_claude so it appears in the visible slice(0,4). */
-  upsertExternalAgent(id: string, name: string, color: string) {
-    if (this.tasks.some((t) => t.id === id)) return;
-    const at = this.tasks.findIndex((t) => t.id === "integration_claude") + 1;
-    this.tasks.splice(at, 0, {
-      id, name, color,
-      state: "idle", stepIndex: 0, steps: [],
-      source: "agent", isIntegration: false,
-    });
-    if (!this.focusId) this.focusId = id;
-    this.notify();
-  }
-
   toggleIntegration(id: string) {
-    if (id === "integration_claude") return;
+    if (isAgentTask(id)) return;
     const active = this.settings.activeIntegrations;
     if (active.includes(id)) {
       this.settings.activeIntegrations = active.filter((x) => x !== id);

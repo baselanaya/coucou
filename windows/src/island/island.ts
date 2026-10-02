@@ -113,7 +113,7 @@ export class Island {
       },
       openTerminal: () => {
         const cwd = State.focusTask?.sessionCwd ?? null;
-        void Bridge.openInVSCode(cwd);
+        void Bridge.openProject(cwd);
       },
       // The ↗ button — same targets as openAgentTarget() on macOS.
       openTarget: () => {
@@ -127,7 +127,7 @@ export class Island {
           integration_notion: "https://notion.so",
           integration_calcom: "https://app.cal.com/bookings",
         };
-        if (task.id === "integration_claude") void Bridge.openInVSCode(task.sessionCwd ?? null);
+        if (task.id === "integration_claude") void Bridge.openProject(task.sessionCwd ?? null);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
       },
@@ -553,20 +553,9 @@ export class Island {
 
     // Outside Tauri (plain browser) drive the cursor from DOM events so the
     // island can be inspected with `npm run dev`.
-    if (!IS_TAURI) this.followPageCursor();
-  }
-
-  /**
-   * Takes the cursor from the page's own mouse events instead of Rust's poll.
-   * Used where the OS has no global cursor position (Wayland): the events only
-   * fire while the pointer is over the island, so leaving the window is
-   * reported as a cursor far away, which is what the poll would have said.
-   */
-  followPageCursor() {
-    window.addEventListener("mousemove", (e) => this.onCursor(e.clientX, e.clientY));
-    window.addEventListener("mouseout", (e) => {
-      if (e.relatedTarget == null) this.onCursor(-10_000, -10_000);
-    });
+    if (!IS_TAURI) {
+      window.addEventListener("mousemove", (e) => this.onCursor(e.clientX, e.clientY));
+    }
   }
 
   /** Cursor in window-logical coordinates. */

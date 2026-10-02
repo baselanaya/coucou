@@ -11,16 +11,21 @@ use serde_json::{json, Value};
 
 use crate::secrets;
 
-const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Server-side fallback: on a policy decline the API retries the same request on
 /// a fallback model inside the same call, so the island never shows a dead end.
+/// Anthropic-only.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MAX_TOKENS: u32 = 4096;
 /// Text and code files are inlined; anything larger is skipped, as on macOS.
 const MAX_INLINE_TEXT: u64 = 200_000;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
+/// The chat speaks the Anthropic Messages API, wherever it is served. Z.AI's
+/// GLM endpoint (https://api.z.ai/api/anthropic) is compatible enough for the
+/// chat: same request shape, same auth — only the server-side web search tool
+/// and the fallback beta are Anthropic's and are left off elsewhere.
+pub const DEFAULT_API_BASE: &str = "https://api.anthropic.com";
 
 const SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
 You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
@@ -73,6 +78,7 @@ pub struct ChatReply {
 pub async fn send(
     chat: &Chat,
     model: &str,
+    api_base: &str,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
@@ -105,16 +111,21 @@ pub async fn send(
 
     chat.push(json!({ "role": "user", "content": content }));
 
-    let body = json!({
+    // The server-side web search tool is Anthropic's alone; other providers
+    // reject the block, so the chat goes without it rather than dying on it.
+    let is_anthropic = api_base.contains("anthropic.com");
+    let mut body = json!({
         "model": model,
         "max_tokens": MAX_TOKENS,
         "system": SYSTEM_PROMPT,
-        "tools": [{ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }],
-        "fallbacks": "default",
         "messages": chat.snapshot(),
     });
+    if is_anthropic {
+        body["tools"] = json!([{ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }]);
+        body["fallbacks"] = json!("default");
+    }
 
-    let response = match call(&key, &body).await {
+    let response = match call(api_base, &key, &body).await {
         Ok(v) => v,
         Err(err) => {
             chat.pop(); // keep the history consistent with what the model saw
@@ -157,18 +168,25 @@ pub async fn send(
     Ok(ChatReply { text })
 }
 
-async fn call(key: &str, body: &Value) -> Result<Value, String> {
+async fn call(api_base: &str, key: &str, body: &Value) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(90))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = client
-        .post(ENDPOINT)
+    let mut request = client
+        .post(format!("{api_base}/v1/messages"))
+        // Both auth spellings, the same key: x-api-key is the Anthropic header,
+        // Bearer is what Z.AI's compatible endpoint reads.
         .header("x-api-key", key)
+        .header("authorization", format!("Bearer {key}"))
         .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("anthropic-beta", FALLBACK_BETA)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if api_base.contains("anthropic.com") {
+        request = request.header("anthropic-beta", FALLBACK_BETA);
+    }
+
+    let response = request
         .json(body)
         .send()
         .await
@@ -187,7 +205,7 @@ async fn call(key: &str, body: &Value) -> Result<Value, String> {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(format!("Claude API {status}: {detail}"));
+        return Err(format!("Chat API {status}: {detail}"));
     }
     serde_json::from_str(&text).map_err(|e| format!("Bad API response: {e}"))
 }

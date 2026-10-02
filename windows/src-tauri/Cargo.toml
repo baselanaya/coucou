@@ -1,6 +1,6 @@
 [package]
 name = "coucou"
-description = "Coucou for Windows and Linux — Mochi lives at the top of your screen"
+description = "Coucou for Windows — Mochi lives at the top of your screen"
 authors = ["Louis Raille"]
 version.workspace = true
 edition.workspace = true
@@ -19,9 +19,15 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# Codex keeps its config in TOML; editing it without wrecking the user's
+# comments and tables is exactly what toml_edit is for.
+toml_edit = "0.22"
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+keyring = "3"
 
+# Just enough Win32 for the island window (cursor poll, no-activate, drag hack)
+# and local timestamps.
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 windows = { version = "0.61", features = [
@@ -35,10 +41,15 @@ windows = { version = "0.61", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Linux: the island needs a global cursor query, which Wayland never gives a
+# normal client — running under XWayland (see main.rs) we can ask X11 directly,
+# the same way the Windows build calls GetCursorPos. raw-window-handle gives us
+# the XID of our own window, for the input shape the clickable island needs.
 [target.'cfg(target_os = "linux")'.dependencies]
-# Secret Service (GNOME Keyring, KWallet) over D-Bus, encrypted in transit.
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+x11 = { version = "2", features = ["xlib"] }
+raw-window-handle = "0.6"
+
+# Local timestamps for the log and the settings backups.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# The GTK that Tauri already runs on, to reach its window for layer-shell and
-# the input region. libgtk-layer-shell itself is called directly (platform/linux.rs).
-gtk = "0.18"

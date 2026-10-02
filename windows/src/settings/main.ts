@@ -41,25 +41,32 @@ function renderDiff(text: string): HTMLElement {
   return box;
 }
 
-// ── Claude Code section ───────────────────────────────────────────────────────
+// ── Coding agents ─────────────────────────────────────────────────────────────
 
-function claudeSection(status: HookStatus): HTMLElement {
+/** How each agent's config file is labelled in the rows below. */
+const CONFIG_LABEL: Record<string, string> = {
+  claude: "settings.json",
+  zcode: "config.json",
+  codex: "hooks.json",
+};
+
+function agentSection(status: HookStatus): HTMLElement {
   const body = h("div", { style: "display:flex;flex-direction:column;gap:12px" });
   const section = h(
     "section",
     {},
-    h("h2", {}, statusDot(status.installed), h("span", { text: "Claude Code" })),
+    h("h2", {}, statusDot(status.installed), h("span", { text: status.name })),
     body,
   );
 
   const rebuild = async () => {
-    const fresh = await Bridge.hooksStatus();
+    const fresh = await Bridge.hooksStatus(status.agent);
     if (fresh) Object.assign(status, fresh);
     clear(body);
     draw();
     const head = section.querySelector("h2")!;
     clear(head);
-    head.append(statusDot(status.installed), h("span", { text: "Claude Code" }));
+    head.append(statusDot(status.installed), h("span", { text: status.name }));
   };
 
   function draw() {
@@ -67,11 +74,12 @@ function claudeSection(status: HookStatus): HTMLElement {
       h("div", {
         class: "hint",
         text: status.installed
-          ? "Coucou is hooked into your Claude Code sessions. Tool calls, questions and permission requests show up in the island, and you can answer them there."
-          : "Install the hooks to see your Claude Code sessions in the island and approve permissions without leaving what you are doing.",
+          ? `Coucou is hooked into your ${status.name} sessions. Tool calls, questions and permission requests show up in the island, and you can answer them there.`
+          : `Install the hooks to see your ${status.name} sessions in the island and approve permissions without leaving what you are doing.`,
       }),
+      h("div", { class: "hint", text: status.blurb }),
       h("div", { class: "row" },
-        h("label", { text: "settings.json" }),
+        h("label", { text: CONFIG_LABEL[status.agent] ?? "config" }),
         h("span", { class: "path", text: status.settingsPath }),
       ),
       h("div", { class: "row" },
@@ -82,9 +90,10 @@ function claudeSection(status: HookStatus): HTMLElement {
     );
 
     if (!status.hookReady) {
+      const relay = status.hookPath.split(/[\\/]/).pop() ?? "coucou-hook";
       body.append(h("div", {
         class: "notice warn",
-        text: "coucou-hook.exe is not in place yet. Restart Coucou; if it still fails, build it with `cargo build -p coucou-hook`.",
+        text: `${relay} is not in place yet. Restart Coucou; if it still fails, build it with \`cargo build -p coucou-hook\`.`,
       }));
     }
 
@@ -95,7 +104,7 @@ function claudeSection(status: HookStatus): HTMLElement {
       onclick: () => showPreview(true),
     });
     // Writing hook commands that point at a relay which isn't there would give
-    // every Claude Code session a broken hook and nothing to show for it.
+    // every agent session a broken hook and nothing to show for it.
     if (!status.hookReady) {
       install.disabled = true;
       install.title = "The relay isn't installed yet.";
@@ -114,9 +123,9 @@ function claudeSection(status: HookStatus): HTMLElement {
   async function showPreview(install: boolean) {
     let preview;
     try {
-      preview = await Bridge.hooksPreview(install);
+      preview = await Bridge.hooksPreview(status.agent, install);
     } catch (err) {
-      // An unreadable or invalid settings.json stops here rather than being
+      // An unreadable or invalid config stops here rather than being
       // treated as empty and written over.
       clear(body);
       body.append(
@@ -134,7 +143,7 @@ function claudeSection(status: HookStatus): HTMLElement {
       h("div", {
         class: "hint",
         text: install
-          ? "This is exactly what will change in your settings.json. Your own hooks are left untouched."
+          ? `This is exactly what will change in your ${CONFIG_LABEL[status.agent] ?? "config"}. Your own hooks are left untouched.`
           : "This removes Coucou's entries only. Your own hooks are left untouched.",
       }),
       renderDiff(preview.diff),
@@ -149,11 +158,15 @@ function claudeSection(status: HookStatus): HTMLElement {
     confirm.addEventListener("click", async () => {
       confirm.disabled = true;
       try {
-        const backup = await Bridge.hooksApply(install, preview.fingerprint);
+        const backup = await Bridge.hooksApply(status.agent, install, preview.fingerprint);
         clear(body);
         body.append(h("div", {
           class: "notice ok",
-          text: `Done. Previous settings saved as ${backup}. Open a new Claude Code session to pick the hooks up.`,
+          text: `Done. Previous settings saved as ${backup}.${
+            status.agent === "codex"
+              ? " Now run /hooks inside Codex once to trust Coucou."
+              : ` Open a new ${status.name} session to pick the hooks up.`
+          }`,
         }));
         window.setTimeout(() => void rebuild(), 2600);
       } catch (err) {
@@ -171,21 +184,30 @@ function claudeSection(status: HookStatus): HTMLElement {
   return section;
 }
 
-// ── Claude API section ────────────────────────────────────────────────────────
+// ── Chat API section ──────────────────────────────────────────────────────────
 
 const MODELS: [string, string][] = [
   ["claude-opus-5", "Claude Opus 5"],
   ["claude-sonnet-5", "Claude Sonnet 5"],
   ["claude-haiku-4-5", "Claude Haiku 4.5"],
+  ["glm-5.3", "GLM 5.3 (Z.AI)"],
+  ["glm-5.3-air", "GLM 5.3 Air (Z.AI)"],
+];
+
+/** Bases the chat knows how to talk to. The select stays editable — any
+ * Anthropic-compatible base works — these are just the two it ships with. */
+const API_BASES: [string, string][] = [
+  ["https://api.anthropic.com", "Anthropic"],
+  ["https://api.z.ai/api/anthropic", "Z.AI (GLM)"],
 ];
 
 function apiSection(hasKey: boolean): HTMLElement {
   const dot = statusDot(hasKey);
-  const state = h("span", { class: "hint", text: hasKey ? "Key saved in the Windows Credential Manager." : "No key yet — the chat needs one." });
+  const state = h("span", { class: "hint", text: hasKey ? "Key saved in the system keyring." : "No key yet — the chat needs one." });
 
   const field = h("input", {
     type: "password",
-    placeholder: hasKey ? "••••••••••••  (stored)" : "sk-ant-...",
+    placeholder: hasKey ? "••••••••••••  (stored)" : "sk-…",
     style: "flex:1 1 auto;min-width:0",
     autocomplete: "off",
     spellcheck: "false",
@@ -199,9 +221,9 @@ function apiSection(hasKey: boolean): HTMLElement {
     const present = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
     dot.style.background = present ? "#22c55e" : "#f4505e";
     state.textContent = present
-      ? "Key saved in the Windows Credential Manager."
+      ? "Key saved in the system keyring."
       : "No key yet — the chat needs one.";
-    field.placeholder = present ? "••••••••••••  (stored)" : "sk-ant-...";
+    field.placeholder = present ? "••••••••••••  (stored)" : "sk-…";
     clearBtn.style.display = present ? "" : "none";
   }
 
@@ -241,14 +263,35 @@ function apiSection(hasKey: boolean): HTMLElement {
     void save();
   });
 
+  // The chat speaks the Anthropic Messages API wherever it is served. Picking
+  // Z.AI points it at GLM; the GLM models above are the ones worth listing.
+  const base = h("input", {
+    type: "text",
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+    list: "api-bases",
+  }) as HTMLInputElement;
+  base.value = settings.apiBase;
+  const datalist = h("datalist", { id: "api-bases" });
+  for (const [url] of API_BASES) datalist.append(h("option", { value: url }));
+  base.addEventListener("change", () => {
+    const value = base.value.trim().replace(/\/+$/, "");
+    if (!value) return;
+    settings.apiBase = value;
+    base.value = value;
+    void save();
+  });
+
   clearBtn.style.display = hasKey ? "" : "none";
 
   return h(
     "section",
     {},
-    h("h2", {}, dot, h("span", { text: "Claude" })),
+    h("h2", {}, dot, h("span", { text: "Chat" })),
     state,
     h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
+    h("div", { class: "row" }, h("label", { text: "API base" }), base, datalist),
     h("div", { class: "row" }, h("label", { text: "Model" }), model),
     feedback,
   );
@@ -425,9 +468,7 @@ async function main() {
     settings = { ...settings, ...boot.settings };
     version = boot.version;
   }
-  const status = (await Bridge.hooksStatus()) ?? {
-    installed: false, settingsPath: "", hookPath: "", hookReady: false,
-  };
+  const statuses = (await Bridge.hooksStatuses()) ?? [];
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
 
@@ -441,7 +482,7 @@ async function main() {
   clear(root);
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
-    claudeSection(status),
+    ...statuses.map(agentSection),
     apiSection(hasKey),
     integrationsSection(present),
     generalSection(),

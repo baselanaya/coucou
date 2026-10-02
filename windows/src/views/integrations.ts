@@ -6,7 +6,7 @@
 
 import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
-import { State, type AgentTask } from "../core/state";
+import { State, isAgentTask, type AccessLevel, type AgentTask } from "../core/state";
 import { Bridge } from "../core/bridge";
 
 /** Same shape as the Swift `timeAgo` computed properties. */
@@ -59,18 +59,27 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   const error = info?.error ?? null;
   // The Claude Code pill is about hooks, not a key — the macOS wording would be
   // misleading here.
-  const missing = task.id === "integration_claude" ? "Hooks not installed" : "Key not configured";
-  const label = error ?? (configured ? "Connected · loading…" : missing);
+  // The agent cards are about hooks, not keys: each says whether its own
+  // harness is wired in.
+  const isAgent = isAgentTask(task.id);
+  const agentHooked =
+    task.id === "integration_zcode" ? State.settings.hooksInstalledZcode
+    : task.id === "integration_codex" ? State.settings.hooksInstalledCodex
+    : State.settings.hooksInstalled;
+  const missing = isAgent ? "Not hooked" : "Key not configured";
+  const connected = isAgent ? "Hooked in · waiting for sessions" : "Connected · loading…";
+  const ready = isAgent ? agentHooked : configured;
+  const label = error ?? (ready ? connected : missing);
   const statusColor = error || !configured ? "#F4505E" : "#22C55E";
 
   const actions = h("div", { class: "int-actions" });
-  if (task.id === "integration_claude") {
+  if (isAgent && task.sessionCwd) {
     actions.append(
       h("button", {
         class: "link-btn",
         style: `color:${task.color}b3`,
-        text: "Open Visual Studio Code",
-        onclick: () => void Bridge.openInVSCode(task.sessionCwd ?? null),
+        text: "Open folder",
+        onclick: () => void Bridge.openProject(task.sessionCwd ?? null),
       }),
     );
   } else if (task.id === "integration_n8n") {
@@ -110,10 +119,64 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   return h(
     "div",
     { class: "int-card" },
-    header(task.color, task.id === "integration_claude" ? "VS Code" : task.name, "Integration"),
+    header(task.color, task.name, "Integration"),
     h("div", { class: "int-status" }, dot(statusColor, 5), h("span", { text: label })),
+    isAgent ? accessRow(task) : null,
     actions,
   );
+}
+
+// ── Access level ──────────────────────────────────────────────────────────────
+
+const ACCESS_LEVELS: { id: AccessLevel; label: string; color: string; hint: string }[] = [
+  { id: "ask", label: "Ask", color: "#22C55E", hint: "Asks before anything risky (each harness's default)" },
+  { id: "auto", label: "Auto", color: "#F29B38", hint: "Answers the routine prompts itself, asks for the rest" },
+  { id: "root", label: "Root", color: "#F4505E", hint: "No permission prompts at all — bypass / full sandbox. New sessions only." },
+];
+
+/**
+ * How much rope this harness gets. One click rewrites the agent's own config
+ * (dated backup, atomic write, applies to sessions started after), so the
+ * click has to be explicit and the current level has to be unmistakable.
+ */
+function accessRow(task: AgentTask): HTMLElement {
+  const info = State.integrations[task.id]?.access ?? null;
+
+  if (info && !info.configurable) {
+    return h("div", { class: "int-status" },
+      dot("#8e939c", 5),
+      h("span", { text: `Access — ${info.note}` }),
+    );
+  }
+
+  const wrap = h("div", { class: "row", style: "gap:6px;flex-wrap:wrap" });
+  wrap.append(h("label", { text: "Access" }));
+  for (const level of ACCESS_LEVELS) {
+    const on = info?.level === level.id;
+    const btn = h("button", {
+      class: "link-btn",
+      text: level.label,
+      title: level.hint,
+      style: `color:${on ? level.color : "#8e939c"};border:1px solid ${on ? level.color : "transparent"};border-radius:8px;padding:1px 10px`,
+    });
+    btn.addEventListener("click", async () => {
+      if (on) return;
+      btn.textContent = "…";
+      try {
+        await Bridge.accessSet(task.id.replace("integration_", ""), level.id);
+        const fresh = await Bridge.accessGet(task.id.replace("integration_", ""));
+        const entry = State.integrations[task.id];
+        if (entry) State.integrations[task.id] = { ...entry, access: fresh };
+        State.notify();
+      } catch (err) {
+        btn.textContent = level.label;
+        console.error("[coucou] access change failed", err);
+      }
+    });
+    wrap.append(btn);
+  }
+  wrap.append(h("span", { class: "hint", style: "flex-basis:100%", text: "New sessions only" }));
+  return wrap;
 }
 
 // ── Vercel ────────────────────────────────────────────────────────────────────
